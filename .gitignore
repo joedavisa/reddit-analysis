@@ -1,1 +1,6 @@
 *.zst*
+/Scripts/*
+*.csv
+*.xlsx
+/.venv
+*.log
