@@ -1,14 +1,29 @@
 import sys
+import os
+import json
+import logging.handlers
+import reddit_util as rdt
 import csv
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
 import ruptures as rpt
 from statsmodels.tsa.stattools import grangercausalitytests
+from tslearn.clustering import TimeSeriesKMeans
 from scipy.signal import find_peaks, correlate
-from datetime import datetime
+from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
+
+
+log = logging.getLogger("bot")
+log.setLevel(logging.DEBUG)
+log.addHandler(logging.StreamHandler())
+
+steamid_name_map = {"1172470":"apexlegends",
+                    "1222670":"Sims4",
+                    "252950":"RocketLeague",
+                    "275850":"NoMansSkyTheGame",}
 
 def normalize(rdata):
     # 3 values in list with dates as key
@@ -88,7 +103,7 @@ def get_steam_lists(data_dict):
     return steam
 
 
-def plot_data(key_list, pc, rev, rtot, maxes):
+def plot_data(key_list: list, pc: list, rev: list, rtot: list, maxes: list):
     plt.plot(key_list, pc, label='Player count')
     plt.plot(key_list, rev, label='Reviews')
     plt.plot(key_list, rtot, label='Reddit activity')
@@ -103,7 +118,7 @@ def plot_data(key_list, pc, rev, rtot, maxes):
     plt.show()
 
 
-def plot_steam_data(key_list, df, maxes, changepoints):
+def plot_steam_data(key_list: list, df: pd.DataFrame, maxes: list, changepoints: list):
     #rpt.display(df, [], pelt)
     plt.plot(df['Date'].values, df['Steam'].values, label='Steam activity')
     plt.plot(df['Date'].values, df['RedditTotal'].values, label='Reddit activity')
@@ -121,7 +136,7 @@ def plot_steam_data(key_list, df, maxes, changepoints):
     plt.show()
 
 
-def get_max_peaks(series, min_dist):
+def get_max_peaks(series: list, min_dist: int):
     # scuffed af damn
     peaks = find_peaks(series,height=0, distance=min_dist)
     max_peak = np.argpartition(peaks[1]['peak_heights'], -10)[-10:]
@@ -156,7 +171,7 @@ def grangers_causation_matrix(data, variables, test='ssr_chi2test', verbose=Fals
     return df
 
 
-def get_changepoint_dates(key_list, changepoints):
+def get_changepoint_dates(key_list: list, changepoints: list):
     dates = []
     for point in changepoints[:-1]:
         dates.append(key_list[point])
@@ -181,14 +196,14 @@ def get_correlations(df):
 
     return gcm1, gcm2, gcm3, gcm4
 
-def get_peaks(pc, rev,rtot, steam):
+def get_peaks(pc, rev, rtot, steam):
     pc_peaks = get_max_peaks(pc, 20)
     rev_peaks = get_max_peaks(rev, 20)
     rtot_peaks = get_max_peaks(rtot, 20)
     steam_peaks = get_max_peaks(steam, 20)
     return pc_peaks, rev_peaks, rtot_peaks, steam_peaks
 
-def get_changepoints(df, steam_peaks, rtot_peaks):
+def get_changepoints(df: pd.DataFrame, steam_peaks: list, rtot_peaks: list):
     steam_df = df['Steam'].values
     algo = rpt.KernelCPD(kernel="rbf",params={"gamma": 1e-2},min_size=15,jump=1).fit(steam_df)
     #algo = rpt.Pelt(model="rbf",min_size=20,jump=1).fit(steam_df)
@@ -198,13 +213,61 @@ def get_changepoints(df, steam_peaks, rtot_peaks):
     # print(changepoints)
 
     dates = get_changepoint_dates(key_list, changepoints)
-    print(dates)
     return changepoints, dates
 
 
-def find_relevant_reddit_submissions(dates):
+def find_relevant_reddit_submissions(filename: str, dates: list):
+    file_lines = 0
+    file_bytes_processed = 0
+    bad_lines = 0
+    app_id = filename.replace("_collated.csv","")
+    app_id = app_id.replace(".\\csv\\","")
+    app_name = steamid_name_map[app_id]
+    field = "subreddit"    
+    # daily_submissions_count = "./csv/" + app_id + "_" + app_name + "_submissions_activity.csv"
+    submission_datafile = "./datafiles/" + app_name + "_submissions.zstnew"
+    relevant_submissions = "./experiments/" + app_id +"_" + app_name + "_changepoint_posts.csv"
+    file_size = os.stat(submission_datafile).st_size
+    with open(relevant_submissions,'w', newline='', encoding="utf-8") as csv_write_handle:
+        csv_writer = csv.writer(csv_write_handle)
+        csv_writer.writerow([app_id, app_name])
+        csv_writer.writerow(['id(name)', 'title', 'permalink', 'num_comments'])
+        for line, file_bytes_processed in rdt.read_lines_zst(submission_datafile):
+            try:
+                obj = json.loads(line)
+                created = datetime.fromtimestamp(int(obj['created_utc']))
+                if int(obj['num_comments']) == 0:
+                    continue
+                if 'name' in obj:
+                    link_id = str(obj['name'])
+                elif 'id' in obj:
+                    link_id = str(obj['id'])
+                else:
+                    link_id = ''
+                if created.date() in dates:
+                    csv_writer.writerow([link_id, str(obj['title']), str(obj['permalink']),str(obj['num_comments'])])
+                temp = obj[field] == app_name
+            except (KeyError, json.JSONDecodeError) as err:
+                bad_lines += 1
+            file_lines += 1
+            if file_lines % 100000 == 0:
+                log.info(f"{created.strftime('%Y-%m-%d %H:%M:%S')} : {file_lines:,} : {bad_lines:,} : {file_bytes_processed:,}:{(file_bytes_processed / file_size) * 100:.0f}%")
+            
 
-    return None
+
+
+def clustering(df):
+    model = TimeSeriesKMeans(n_clusters=3, metric="dtw",max_iter=10)
+    model.fit(df)
+
+
+def get_interesting_dates(date_list: list, date_range: int):
+    dates = []
+    for date in date_list:        
+        for i in range(-date_range, date_range+1):
+            dates.append(date + timedelta(days=i))
+    dates.sort()
+    return dates
 
 
 if __name__ == "__main__":
@@ -228,9 +291,13 @@ if __name__ == "__main__":
     gc1, gc2, gc3, gc4 = get_correlations(df)
     pc_peak, rev_peak, rtot_peak, steam_peak = get_peaks(pc, rev, rtot, steam)
     changepoints, dates = get_changepoints(df, steam_peak, rtot_peak)
+    full_date_list = get_interesting_dates(date_list=dates, date_range=1)
 
-    #plot_data(data_dict, pc,rev,rtot)
-    #plot_data(key_list, pc, rev, rtot, [pc_peaks, rev_peaks, rtot_peaks])
-    plot_steam_data(key_list, df, [steam_peak, rtot_peak], changepoints=changepoints)
+    # clustering(df.loc[:,['Steam']])
+
+    # plot_data(data_dict, pc,rev,rtot)
+    # plot_data(key_list, pc, rev, rtot, [pc_peaks, rev_peaks, rtot_peaks])
+    # plot_steam_data(key_list, df, [steam_peak, rtot_peak], changepoints=changepoints)
 
     # go through reddit submissions 3 days around changepoints and find posts that could be info drops
+    find_relevant_reddit_submissions(filename, dates)
